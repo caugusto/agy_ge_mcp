@@ -44,7 +44,7 @@ def _build_ssl_context() -> ssl.SSLContext:
 
 _SSL_CTX = _build_ssl_context()
 GCLOUD_PATHS = [
-    "/Users/caugusto/google-cloud-sdk/bin/gcloud",
+    os.path.expanduser("~/google-cloud-sdk/bin/gcloud"),
     "/opt/homebrew/bin/gcloud",
     "/usr/local/bin/gcloud",
     "gcloud",
@@ -422,7 +422,7 @@ def send_response(msg_id: Any, result: Any = None, error: dict[str, Any] | None 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Gemini Enterprise MCP Stdio Server for Antigravity")
-    parser.add_argument("--project", default="16933400417", help="GCP Project ID or Number")
+    parser.add_argument("--project", default=os.environ.get("GE_MCP_PROJECT", ""), help="GCP Project ID or Number")
     parser.add_argument("--location", default="global", help="Discovery Engine location")
     parser.add_argument(
         "--engine",
@@ -431,7 +431,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--connector",
-        default="jira-connector_1790881435408",
+        default=os.environ.get("GE_MCP_CONNECTOR", ""),
         help="Default Gemini Enterprise connector collection ID",
     )
     parser.add_argument(

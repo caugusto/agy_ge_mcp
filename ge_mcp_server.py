@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
-ge_mcp_server.py (v2 - Portable Engine-Scoped Meta-Tool Router)
----------------------------------------------------------------
-Standalone Model Context Protocol (MCP) stdio server for Google Antigravity (AGY)
-that connects to a specific Google Cloud Gemini Enterprise Engine (`--engine`) and
-exposes ONLY the connectors and data stores bound to that Engine instance.
+ge_mcp_server.py (v2 - Engine-Scoped Meta-Tool Router)
 
-Zero external Python dependencies (uses Python 3 standard library + `gcloud auth`).
-
-Meta-Tools Exposed:
-  1. `ge_list_connectors`: Lists ONLY the connectors and data stores bound to `--engine`.
-  2. `ge_search_tools`: Lists/searches MCP tools and schemas on an engine-bound connector.
-  3. `ge_call_tool`: Executes an MCP tool on an engine-bound connector (rejects unlinked connectors).
-  4. `ge_assist_query`: Queries the Gemini Enterprise Engine (`streamAssist`) across bound data stores.
+A zero-dependency STDIO Model Context Protocol (MCP) server for Google Antigravity (AGY)
+that connects to a specific Gemini Enterprise (Agentspace / Discovery Engine) instance
+and dynamically routes tool discovery, action execution, and grounded search strictly
+across the connectors and data stores bound to that Engine ID.
 """
 
 import argparse
@@ -27,12 +20,21 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-API_BASE = "https://discoveryengine.googleapis.com/v1alpha"
+
+def _api_base(location: str) -> str:
+    loc = (location or "global").strip().lower()
+    if loc in ("us", "eu"):
+        return f"https://{loc}-discoveryengine.googleapis.com/v1alpha"
+    return "https://discoveryengine.googleapis.com/v1alpha"
 
 
 def _build_ssl_context() -> ssl.SSLContext:
     ctx = ssl.create_default_context()
-    for cafile in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+    for cafile in (
+        "/etc/ssl/cert.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ):
         if os.path.exists(cafile):
             try:
                 ctx.load_verify_locations(cafile=cafile)
@@ -44,32 +46,40 @@ def _build_ssl_context() -> ssl.SSLContext:
 _SSL_CTX = _build_ssl_context()
 
 
-def _candidate_gcloud_paths() -> list[str]:
-    paths = []
+def _discover_gcloud_candidates() -> list[str]:
+    candidates: list[str] = []
+    env_gcloud = os.environ.get("GCLOUD_BIN")
+    if env_gcloud:
+        candidates.append(os.path.expanduser(os.path.expandvars(env_gcloud)))
     which_gcloud = shutil.which("gcloud")
     if which_gcloud:
-        paths.append(which_gcloud)
+        candidates.append(which_gcloud)
     for p in (
         os.path.expanduser("~/google-cloud-sdk/bin/gcloud"),
+        os.path.expanduser("~/.local/share/google-cloud-sdk/bin/gcloud"),
         "/opt/homebrew/bin/gcloud",
         "/usr/local/bin/gcloud",
         "/usr/bin/gcloud",
+        "/snap/bin/gcloud",
         "gcloud",
     ):
-        if p not in paths:
-            paths.append(p)
-    return paths
+        if p not in candidates:
+            candidates.append(p)
+    return candidates
 
 
 _TOKEN_CACHE: dict[str, Any] = {"token": "", "expires_at": 0.0}
-_ENGINE_SCOPE_CACHE: dict[str, Any] = {"data": None, "expires_at": 0.0}
+_ENGINE_SCOPE_CACHE: dict[str, Any] = {"key": "", "data": None, "expires_at": 0.0}
 
 
 def get_access_token() -> str:
-    """Obtains a Google Cloud access token via gcloud with a 5-minute in-memory cache."""
     now = time.time()
     if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"]:
         return _TOKEN_CACHE["token"]
+
+    env_token = os.environ.get("GE_MCP_ACCESS_TOKEN")
+    if env_token:
+        return env_token.strip()
 
     env = dict(os.environ)
     existing_metrics = env.get("CLOUDSDK_METRICS_ENVIRONMENT", "")
@@ -78,7 +88,7 @@ def get_access_token() -> str:
     )
 
     last_err = ""
-    for gcloud_bin in _candidate_gcloud_paths():
+    for gcloud_bin in _discover_gcloud_candidates():
         try:
             token = subprocess.check_output(
                 [gcloud_bin, "auth", "print-access-token"],
@@ -96,7 +106,8 @@ def get_access_token() -> str:
             continue
 
     raise RuntimeError(
-        f"Failed to obtain gcloud access token. Run `gcloud auth login` first. ({last_err})"
+        f"Failed to obtain Google Cloud access token via gcloud. "
+        f"Run 'gcloud auth login' first. Last error: {last_err}"
     )
 
 
@@ -107,7 +118,6 @@ def de_request(
     body: dict[str, Any] | None = None,
     timeout: int = 60,
 ) -> tuple[int, Any]:
-    """Performs an authenticated HTTP request to Google Cloud Discovery Engine."""
     token = get_access_token()
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(
@@ -146,13 +156,6 @@ def discover_engine_bound_resources(
     force_refresh: bool = False,
     timeout: int = 15,
 ) -> dict[str, Any]:
-    """
-    Returns ONLY the connectors and data stores bound to the specified `engine_id`
-    by inspecting:
-      1. `engines/{engine_id}/widgetConfigs/default_search_widget_config` (`collectionComponents`)
-      2. `engines/{engine_id}` (`dataStoreIds`)
-    Unlinked project-level collections are never included.
-    """
     now = time.time()
     cache_key = f"{project}:{location}:{engine_id}"
     if (
@@ -163,7 +166,7 @@ def discover_engine_bound_resources(
     ):
         return _ENGINE_SCOPE_CACHE["data"]
 
-    base = f"{API_BASE}/projects/{project}/locations/{location}"
+    base = f"{_api_base(location)}/projects/{project}/locations/{location}"
     eng_url = f"{base}/collections/default_collection/engines/{engine_id}"
     widget_url = f"{eng_url}/widgetConfigs/default_search_widget_config"
 
@@ -171,16 +174,19 @@ def discover_engine_bound_resources(
     wid_code, wid_data = de_request("GET", widget_url, project, timeout=timeout)
 
     bound_datastore_ids: list[str] = (
-        eng_data.get("dataStoreIds", []) if eng_code == 200 and isinstance(eng_data, dict) else []
+        eng_data.get("dataStoreIds", [])
+        if eng_code == 200 and isinstance(eng_data, dict)
+        else []
     )
 
     connectors_by_id: dict[str, dict[str, Any]] = {}
     consumed_datastores: set[str] = set()
 
-    # 1. Authoritative action/federated connectors from widgetConfig.collectionComponents
     if wid_code == 200 and isinstance(wid_data, dict):
         for comp in wid_data.get("collectionComponents", []):
-            cid = clean_collection_id(comp.get("id") or comp.get("name", "").split("/")[-1])
+            cid = clean_collection_id(
+                comp.get("id") or comp.get("name", "").split("/")[-1]
+            )
             if not cid or cid == "default_collection":
                 continue
             auth_state = comp.get("connectorAuthState", {})
@@ -205,7 +211,6 @@ def discover_engine_bound_resources(
                 "boundDataStores": ds_comps,
             }
 
-    # 2. Enrich engine-bound connectors with enabledActionsCount from their dataConnector resource
     for cid, info in list(connectors_by_id.items()):
         dc_url = f"{base}/collections/{cid}/dataConnector"
         dc_code, dc_data = de_request("GET", dc_url, project, timeout=timeout)
@@ -217,15 +222,19 @@ def discover_engine_bound_resources(
             info["enabledActionsCount"] = len(enabled_actions)
             info["enabledActions"] = enabled_actions
 
-    # 3. Remaining bound dataStoreIds on the engine (e.g. GCS / BQ search data stores attached to this engine)
     bound_search_datastores = [
         ds_id for ds_id in bound_datastore_ids if ds_id not in consumed_datastores
     ]
 
     result = {
         "project": project,
+        "location": location,
         "engineId": engine_id,
-        "engineDisplayName": eng_data.get("displayName", engine_id) if eng_code == 200 else engine_id,
+        "engineDisplayName": (
+            eng_data.get("displayName", engine_id)
+            if eng_code == 200 and isinstance(eng_data, dict)
+            else engine_id
+        ),
         "connectors": list(connectors_by_id.values()),
         "allowlistedConnectorIds": sorted(connectors_by_id.keys()),
         "boundSearchDataStores": bound_search_datastores,
@@ -245,11 +254,6 @@ def resolve_and_validate_connector(
     location: str,
     engine_id: str,
 ) -> tuple[str | None, str | None]:
-    """
-    Validates that `requested_connector` (by collection ID, dataSource name, or displayName)
-    is strictly bound to `engine_id`.
-    Returns `(resolved_collection_id, error_message)`.
-    """
     scope = discover_engine_bound_resources(project, location, engine_id)
     allowlisted = scope.get("connectors", [])
     target = clean_collection_id(requested_connector)
@@ -268,10 +272,13 @@ def resolve_and_validate_connector(
         ):
             return c["connectorId"], None
 
-    allowed_summary = ", ".join(
-        f"'{c['connectorId']}' ({c.get('dataSourceDisplayName') or c.get('dataSource')})"
-        for c in allowlisted
-    ) or "none"
+    allowed_summary = (
+        ", ".join(
+            f"'{c['connectorId']}' ({c.get('dataSourceDisplayName') or c.get('dataSource')})"
+            for c in allowlisted
+        )
+        or "none"
+    )
     return (
         None,
         (
@@ -289,10 +296,9 @@ def invoke_connector_mcp(
     mcp_payload: dict[str, Any],
     timeout: int = 60,
 ) -> tuple[int, Any]:
-    """Calls Discovery Engine dataConnector:invokeConnectorMcp."""
     col_id = clean_collection_id(connector_id)
     url = (
-        f"{API_BASE}/projects/{project}/locations/{location}/"
+        f"{_api_base(location)}/projects/{project}/locations/{location}/"
         f"collections/{col_id}/dataConnector:invokeConnectorMcp"
     )
     body = {k: v for k, v in mcp_payload.items() if k not in ("jsonrpc", "id")}
@@ -300,7 +306,6 @@ def invoke_connector_mcp(
 
 
 def _normalize_json_schema(schema: Any) -> Any:
-    """Normalizes Discovery Engine's array-typed JSON schemas (e.g. ['object'] -> 'object') for MCP clients."""
     if not isinstance(schema, dict):
         return schema
     out = dict(schema)
@@ -317,11 +322,14 @@ def _normalize_json_schema(schema: Any) -> Any:
     return out
 
 
-def build_meta_tools(project: str, location: str, engine_id: str) -> list[dict[str, Any]]:
-    """Builds the 4 engine-scoped meta-tools, embedding the live engine allowlist into their descriptions."""
+def build_meta_tools(
+    project: str, location: str, engine_id: str
+) -> list[dict[str, Any]]:
     connector_summary = "call `ge_list_connectors` to view bound connectors"
     try:
-        scope = discover_engine_bound_resources(project, location, engine_id, timeout=6)
+        scope = discover_engine_bound_resources(
+            project, location, engine_id, timeout=6
+        )
         conns = scope.get("connectors", [])
         if conns:
             connector_summary = ", ".join(
@@ -371,8 +379,7 @@ def build_meta_tools(project: str, location: str, engine_id: str) -> list[dict[s
                         "type": "string",
                         "description": (
                             "Optional keyword filter to match tool names or descriptions "
-                            "(e.g. 'issue', 'project', 'board', 'mail', 'calendar', 'file', 'sql'). "
-                            "Leave empty to list all tools."
+                            "(e.g. 'issue', 'project', 'mail', 'calendar', 'file', 'sql'). Leave empty to list all tools."
                         ),
                     },
                     "include_schemas": {
@@ -435,7 +442,6 @@ def handle_tool_call(
     location: str,
     engine_id: str,
 ) -> dict[str, Any]:
-    """Executes one of the 4 engine-scoped meta-tools."""
     try:
         if name == "ge_list_connectors":
             refresh = bool(arguments.get("refresh", False))
@@ -449,7 +455,9 @@ def handle_tool_call(
 
         if name == "ge_search_tools":
             raw_conn = arguments.get("connector", "")
-            cid, err = resolve_and_validate_connector(raw_conn, project, location, engine_id)
+            cid, err = resolve_and_validate_connector(
+                raw_conn, project, location, engine_id
+            )
             if err or not cid:
                 return {
                     "isError": True,
@@ -471,14 +479,20 @@ def handle_tool_call(
                     "content": [{"type": "text", "text": json.dumps(data, indent=2)}],
                 }
 
-            raw_tools = data.get("result", {}).get("tools") or data.get("tools") or []
+            raw_tools = (
+                data.get("result", {}).get("tools") or data.get("tools") or []
+            )
             matched = []
             for t in raw_tools:
                 if not isinstance(t, dict) or not t.get("name"):
                     continue
                 t_name = t["name"]
                 t_desc = t.get("description", "")
-                if keyword and keyword not in t_name.lower() and keyword not in t_desc.lower():
+                if (
+                    keyword
+                    and keyword not in t_name.lower()
+                    and keyword not in t_desc.lower()
+                ):
                     continue
                 entry: dict[str, Any] = {
                     "name": t_name,
@@ -486,7 +500,8 @@ def handle_tool_call(
                 }
                 if include_schemas:
                     entry["inputSchema"] = _normalize_json_schema(
-                        t.get("inputSchema") or {"type": "object", "properties": {}}
+                        t.get("inputSchema")
+                        or {"type": "object", "properties": {}}
                     )
                 matched.append(entry)
 
@@ -511,7 +526,9 @@ def handle_tool_call(
 
         if name == "ge_call_tool":
             raw_conn = arguments.get("connector", "")
-            cid, err = resolve_and_validate_connector(raw_conn, project, location, engine_id)
+            cid, err = resolve_and_validate_connector(
+                raw_conn, project, location, engine_id
+            )
             if err or not cid:
                 return {
                     "isError": True,
@@ -541,7 +558,7 @@ def handle_tool_call(
         if name == "ge_assist_query":
             query_text = arguments.get("query", "")
             url = (
-                f"{API_BASE}/projects/{project}/locations/{location}/"
+                f"{_api_base(location)}/projects/{project}/locations/{location}/"
                 f"collections/default_collection/engines/{engine_id}/"
                 f"assistants/default_assistant:streamAssist"
             )
@@ -576,7 +593,9 @@ def handle_tool_call(
         }
 
 
-def send_response(msg_id: Any, result: Any = None, error: dict[str, Any] | None = None) -> None:
+def send_response(
+    msg_id: Any, result: Any = None, error: dict[str, Any] | None = None
+) -> None:
     payload: dict[str, Any] = {"jsonrpc": "2.0", "id": msg_id}
     if error is not None:
         payload["error"] = error
@@ -592,18 +611,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--project",
-        default=os.environ.get("GE_MCP_PROJECT", "16933400417"),
-        help="GCP Project ID or Project Number",
+        default=os.environ.get("GE_MCP_PROJECT", ""),
+        help="GCP Project ID or Number (or set GE_MCP_PROJECT env var)",
     )
     parser.add_argument(
         "--location",
         default=os.environ.get("GE_MCP_LOCATION", "global"),
-        help="Discovery Engine location (default: global)",
+        help="Discovery Engine location: global, us, or eu (default: global)",
     )
     parser.add_argument(
         "--engine",
-        default=os.environ.get("GE_MCP_ENGINE", "test1-agentspace_1741135345115"),
-        help="Gemini Enterprise Engine ID to scope connectors and data stores to",
+        default=os.environ.get("GE_MCP_ENGINE", ""),
+        help="Gemini Enterprise Engine ID to scope connectors and data stores to (or set GE_MCP_ENGINE env var)",
     )
     parser.add_argument(
         "--call-tool",
@@ -621,6 +640,12 @@ def main() -> None:
         help="Optional path to JSON arguments file for --call-tool",
     )
     args = parser.parse_args()
+
+    if not args.project or not args.engine:
+        sys.stderr.write(
+            "ERROR: Both --project (or GE_MCP_PROJECT) and --engine (or GE_MCP_ENGINE) are required.\n"
+        )
+        sys.exit(1)
 
     if args.call_tool:
         if args.tool_args_file:

@@ -1,15 +1,15 @@
 {
   "mcpServers": {
     "gemini-enterprise": {
-      "command": "/usr/bin/python3",
+      "command": "sh",
       "args": [
-        "/Users/<YOUR_USERNAME>/.gemini/config/ge_mcp_server.py",
-        "--project=<YOUR_GCP_PROJECT_NUMBER_OR_ID>",
-        "--engine=<YOUR_GEMINI_ENTERPRISE_ENGINE_ID>",
-        "--location=global"
+        "-c",
+        "PATH=\"$HOME/google-cloud-sdk/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\" exec python3 \"$HOME/.gemini/config/ge_mcp_server.py\""
       ],
       "env": {
-        "PATH": "/Users/<YOUR_USERNAME>/google-cloud-sdk/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "GE_MCP_PROJECT": "<YOUR_GCP_PROJECT_NUMBER_OR_ID>",
+        "GE_MCP_ENGINE": "<YOUR_GEMINI_ENTERPRISE_ENGINE_ID>",
+        "GE_MCP_LOCATION": "global",
         "PYTHONUNBUFFERED": "1"
       }
     }

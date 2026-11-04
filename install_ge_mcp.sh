@@ -7,19 +7,6 @@
 #
 # Usage:
 #   bash install_ge_mcp.sh --project <PROJECT_ID_OR_NUMBER> [--engine <ENGINE_ID>] [--location global]
-#
-# What this script does:
-#   1. Auto-detects python3 and gcloud on the target machine.
-#   2. Verifies active gcloud authentication.
-#   3. Auto-discovers the Gemini Enterprise Engine ID in the project if --engine
-#      is omitted (or lists available engines if multiple exist).
-#   4. Installs ge_mcp_server.py into ~/.gemini/config/ge_mcp_server.py.
-#   5. Safely merges the "gemini-enterprise" server entry into both:
-#        - ~/.gemini/config/mcp_config.json
-#        - ~/.gemini/antigravity/mcp_config.json
-#      (preserving all existing MCP servers and creating timestamped backups).
-#   6. Runs a live smoke test (ge_list_connectors) to verify engine-scoped
-#      connector discovery.
 # ==============================================================================
 
 set -euo pipefail
@@ -36,7 +23,7 @@ Usage:
 
 Options:
   --project <PROJECT>     (Required) GCP Project ID or Project Number hosting Gemini Enterprise.
-  --engine <ENGINE_ID>    (Optional) Gemini Enterprise Engine / App ID (e.g. test1-agentspace_1741135345115).
+  --engine <ENGINE_ID>    (Optional) Gemini Enterprise Engine / App ID.
                           If omitted, the installer queries Discovery Engine and auto-selects if 1 engine exists,
                           or lists all engines in the project so you can choose one.
   --location <LOCATION>   (Optional) Discovery Engine location: global (default), us, or eu.
@@ -81,7 +68,7 @@ echo "=================================================================="
 echo " Gemini Enterprise MCP Router Installer for Antigravity (AGY)"
 echo "=================================================================="
 
-# 1. Detect python3
+# 1. Detect python3 dynamically
 PYTHON_BIN="$(command -v python3 || true)"
 if [[ -z "$PYTHON_BIN" ]]; then
   echo "ERROR: python3 not found in PATH. Please install Python 3.9+." >&2
@@ -89,16 +76,15 @@ if [[ -z "$PYTHON_BIN" ]]; then
 fi
 echo "[1/6] Found Python:  $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 
-# 2. Detect gcloud
+# 2. Detect gcloud dynamically
 GCLOUD_BIN="$(command -v gcloud || true)"
 if [[ -z "$GCLOUD_BIN" && -x "$HOME/google-cloud-sdk/bin/gcloud" ]]; then
   GCLOUD_BIN="$HOME/google-cloud-sdk/bin/gcloud"
 fi
 if [[ -z "$GCLOUD_BIN" ]]; then
-  echo "ERROR: gcloud CLI not found in PATH or ~/google-cloud-sdk/bin/gcloud." >&2
+  echo "ERROR: gcloud CLI not found in PATH or \$HOME/google-cloud-sdk/bin/gcloud." >&2
   exit 1
 fi
-GCLOUD_DIR="$(dirname "$GCLOUD_BIN")"
 echo "[2/6] Found gcloud:  $GCLOUD_BIN"
 
 # 3. Verify gcloud auth token
@@ -136,10 +122,11 @@ prefix = f"{location}-" if location in ("us", "eu") else ""
 url = f"https://{prefix}discoveryengine.googleapis.com/v1alpha/projects/{project}/locations/{location}/collections/default_collection/engines"
 
 ctx = ssl.create_default_context()
-try:
-    ctx.load_verify_locations(cafile="/etc/ssl/cert.pem")
-except Exception:
-    pass
+for cafile in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+    try:
+        ctx.load_verify_locations(cafile=cafile)
+    except Exception:
+        pass
 
 req = urllib.request.Request(url, headers={
     "Authorization": f"Bearer {token}",
@@ -178,7 +165,7 @@ else
   echo "[4/6] Using Gemini Enterprise Engine ID: $ENGINE (location=$LOCATION)"
 fi
 
-# 5. Copy ge_mcp_server.py and update mcp_config.json files
+# 5. Copy ge_mcp_server.py to $HOME/.gemini/config/ge_mcp_server.py and write dynamic mcp_config.json
 TARGET_DIR="$HOME/.gemini/config"
 TARGET_PY="$TARGET_DIR/ge_mcp_server.py"
 mkdir -p "$TARGET_DIR"
@@ -186,29 +173,30 @@ mkdir -p "$HOME/.gemini/antigravity"
 
 cp "$SOURCE_PY" "$TARGET_PY"
 chmod +x "$TARGET_PY"
-echo "[5/6] Installed MCP server script to: $TARGET_PY"
+echo "[5/6] Installed MCP server script to: \$HOME/.gemini/config/ge_mcp_server.py"
 
-"$PYTHON_BIN" - "$TARGET_PY" "$PYTHON_BIN" "$GCLOUD_DIR" "$PROJECT_TARGET" "$ENGINE" "$LOCATION" "$SERVER_NAME" <<'PYEOF'
+"$PYTHON_BIN" - "$PROJECT_TARGET" "$ENGINE" "$LOCATION" "$SERVER_NAME" <<'PYEOF'
 import datetime, json, os, shutil, sys
 
-target_py, python_bin, gcloud_dir, project, engine, location, server_name = sys.argv[1:8]
+project, engine, location, server_name = sys.argv[1:5]
 
 config_paths = [
     os.path.expanduser("~/.gemini/config/mcp_config.json"),
     os.path.expanduser("~/.gemini/antigravity/mcp_config.json"),
 ]
 
-path_env = f"{gcloud_dir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# Dynamic shell-based invocation so $HOME and $PATH resolve at runtime on any OS
+# (macOS /Users/..., Linux /home/..., Cloudtop, etc.) without hardcoded user paths.
 server_entry = {
-    "command": python_bin,
+    "command": "sh",
     "args": [
-        target_py,
-        f"--project={project}",
-        f"--engine={engine}",
-        f"--location={location}",
+        "-c",
+        'PATH="$HOME/google-cloud-sdk/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec python3 "$HOME/.gemini/config/ge_mcp_server.py"',
     ],
     "env": {
-        "PATH": path_env,
+        "GE_MCP_PROJECT": project,
+        "GE_MCP_ENGINE": engine,
+        "GE_MCP_LOCATION": location,
         "PYTHONUNBUFFERED": "1",
     },
 }
