@@ -1,0 +1,16 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# macOS & IDE artifacts
+.DS_Store
+.idea/
+.vscode/
+
+# Backup files containing local paths or tokens
+*.bak*
+mcp_config.local.json

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "gemini-enterprise": {
+      "command": "/usr/bin/python3",
+      "args": [
+        "/Users/<YOUR_USERNAME>/.gemini/config/ge_mcp_server.py",
+        "--project=<YOUR_GCP_PROJECT_NUMBER_OR_ID>",
+        "--engine=<YOUR_GEMINI_ENTERPRISE_ENGINE_ID>",
+        "--location=global"
+      ],
+      "env": {
+        "PATH": "/Users/<YOUR_USERNAME>/google-cloud-sdk/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
