@@ -11,7 +11,7 @@ Instead of registering a separate MCP server in `mcp_config.json` for every conn
 ```mermaid
 flowchart LR
     User["User in Antigravity IDE / CLI"] --> AGY["Antigravity Agent"]
-    AGY <-->|"STDIO JSON-RPC (4 Meta-Tools)"| MCP["ge_mcp_server.py (--project, --engine)"]
+    AGY <-->|"STDIO JSON-RPC (4 Meta-Tools)"| MCP["ge_mcp_server.py (--project, --engine, --location)"]
     MCP -->|"1. Check Bound Connectors"| Widget["Discovery Engine widgetConfigs (default_search_widget_config)"]
     MCP -->|"2. Discover & Execute Tools"| Invoke["Discovery Engine :invokeConnectorMcp"]
     MCP -->|"3. Grounded Enterprise Search"| Assist["Discovery Engine :streamAssist"]
@@ -24,6 +24,11 @@ flowchart LR
 > [!IMPORTANT]
 > **Strict Engine-Level Isolation:** `ge_mcp_server.py` inspects the target engine's `default_search_widget_config` (`collectionComponents`) and `dataStoreIds` before listing or invoking any tool. Even if a GCP project hosts dozens of connectors across other Gemini Enterprise instances, **users can only see and invoke connectors attached to their configured `GE_MCP_ENGINE`**.
 
+> [!NOTE]
+> **Discovery Engine API Versions (`v1` vs `v1alpha`):**
+> - **GA `v1` Endpoints Used:** Engine discovery/metadata (`GET /v1/.../engines/{id}`) and grounded enterprise search (`POST /v1/.../assistants/default_assistant:streamAssist`) use the General Availability **`v1`** API.
+> - **`v1alpha`-Only Endpoints Used:** The Connector MCP bridge (`POST /v1alpha/.../dataConnector:invokeConnectorMcp`) and BAP action state metadata (`dataConnector` / `widgetConfigs`) are currently only exposed in **`v1alpha`** (calling `:invokeConnectorMcp` on `v1` or `v1beta` returns `HTTP 404`).
+
 ---
 
 ## 2. Repository Contents
@@ -31,7 +36,7 @@ flowchart LR
 | File | Description |
 | :--- | :--- |
 | [`ge_mcp_server.py`](./ge_mcp_server.py) | Zero-dependency Python 3 MCP server implementing the 4 engine-scoped meta-tools (`ge_list_connectors`, `ge_search_tools`, `ge_call_tool`, `ge_assist_query`). Dynamically locates `gcloud` across macOS and Linux paths. |
-| [`install_ge_mcp.sh`](./install_ge_mcp.sh) | Automated installer script that detects `python3` and `gcloud`, discovers or validates `--engine`, installs `ge_mcp_server.py` into `$HOME/.gemini/config/`, safely merges `mcp_config.json`, and runs a live smoke test. |
+| [`install_ge_mcp.sh`](./install_ge_mcp.sh) | Automated installer script that detects `python3` and `gcloud`, discovers or validates `--engine` and its `--location`, installs `ge_mcp_server.py` into `$HOME/.gemini/config/`, safely merges `mcp_config.json`, and runs a live smoke test. |
 | [`mcp_config.example.json`](./mcp_config.example.json) | Portable, OS-agnostic `mcp_config.json` template using `$HOME` runtime expansion (no hardcoded `/Users/...` or `/home/...` paths). |
 | [`legacy_v1/ge_mcp_server.v1_backup.py`](./legacy_v1/ge_mcp_server.v1_backup.py) | Backup of the initial `v1` single-connector MCP server design. |
 
@@ -62,19 +67,17 @@ Clone this repository and run [`install_ge_mcp.sh`](./install_ge_mcp.sh):
 git clone <REPO_URL> ~/Documents/antigravity/agy_ge_mcp
 cd ~/Documents/antigravity/agy_ge_mcp
 
-# If you know both your Project ID/Number and Engine ID:
+# Pass your Project, Engine ID, and the Engine's Location (e.g. global, us, or eu):
 bash install_ge_mcp.sh \
   --project <YOUR_GCP_PROJECT_ID_OR_NUMBER> \
   --engine <YOUR_GEMINI_ENTERPRISE_ENGINE_ID> \
-  --location global
+  --location <YOUR_ENGINE_LOCATION>
 ```
 
-If you **do not know your Engine ID**, omit `--engine`:
-```bash
-bash install_ge_mcp.sh --project <YOUR_GCP_PROJECT_ID_OR_NUMBER>
-```
-- If the project has **one** Gemini Enterprise engine, the installer selects it automatically.
-- If the project has **multiple** engines, the installer lists every engine ID and display name in the project so you can pick the right one.
+> [!TIP]
+> **Auto-Discovery of Engine ID & Location:**
+> - If you omit `--location`, `install_ge_mcp.sh` automatically queries Discovery Engine (`global`, `us`, `eu`) to detect which multi-region hosts your `--engine` and sets `GE_MCP_LOCATION` to match.
+> - If you omit both `--engine` and `--location` (`bash install_ge_mcp.sh --project <YOUR_GCP_PROJECT_ID_OR_NUMBER>`), the installer scans all multi-regions (`global`, `us`, `eu`): if 1 engine exists, it selects both the Engine ID and its Location automatically; if multiple exist, it prints the exact `--engine <ID> --location <LOC>` flags for each instance so you can choose one.
 
 ---
 
@@ -103,7 +106,7 @@ bash install_ge_mcp.sh --project <YOUR_GCP_PROJECT_ID_OR_NUMBER>
          "env": {
            "GE_MCP_PROJECT": "<YOUR_GCP_PROJECT_NUMBER_OR_ID>",
            "GE_MCP_ENGINE": "<YOUR_GEMINI_ENTERPRISE_ENGINE_ID>",
-           "GE_MCP_LOCATION": "global",
+           "GE_MCP_LOCATION": "<YOUR_ENGINE_LOCATION>",
            "PYTHONUNBUFFERED": "1"
          }
        }
@@ -116,7 +119,7 @@ bash install_ge_mcp.sh --project <YOUR_GCP_PROJECT_ID_OR_NUMBER>
    python3 "$HOME/.gemini/config/ge_mcp_server.py" \
      --project="<YOUR_GCP_PROJECT_NUMBER_OR_ID>" \
      --engine="<YOUR_GEMINI_ENTERPRISE_ENGINE_ID>" \
-     --location=global \
+     --location="<YOUR_ENGINE_LOCATION>" \
      --call-tool ge_list_connectors
    ```
 
@@ -132,7 +135,7 @@ Because `command` and `args` use runtime `$HOME` and `$PATH` expansion (and `ge_
 | :--- | :--- | :--- | :--- |
 | `GE_MCP_PROJECT` | **Yes** | Target GCP Project Number (preferred) or Project ID | Run `gcloud projects describe <PROJECT_ID> --format="value(projectNumber)"` |
 | `GE_MCP_ENGINE` | **Yes** | Target Gemini Enterprise App / Engine ID | Found in **Google Cloud Console -> Agent Builder -> Apps**, or by running `bash install_ge_mcp.sh --project <PROJECT>` |
-| `GE_MCP_LOCATION` | Optional (`global`) | Multi-region of the Gemini Enterprise app (`global`, `us`, or `eu`) | Check the Location column in **Agent Builder -> Apps** (usually `global`) |
+| `GE_MCP_LOCATION` | **Yes** *(must match engine location)* | Multi-region where `GE_MCP_ENGINE` is deployed (`global`, `us`, or `eu`). Dictated by the Gemini Enterprise instance's location. | Check the **Location** column for the app in **Agent Builder -> Apps**, or let `install_ge_mcp.sh` auto-detect it |
 
 ---
 

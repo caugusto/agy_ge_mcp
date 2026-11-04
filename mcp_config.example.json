@@ -9,7 +9,7 @@
       "env": {
         "GE_MCP_PROJECT": "<YOUR_GCP_PROJECT_NUMBER_OR_ID>",
         "GE_MCP_ENGINE": "<YOUR_GEMINI_ENTERPRISE_ENGINE_ID>",
-        "GE_MCP_LOCATION": "global",
+        "GE_MCP_LOCATION": "<YOUR_ENGINE_LOCATION>",
         "PYTHONUNBUFFERED": "1"
       }
     }

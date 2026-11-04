@@ -6,9 +6,17 @@ A zero-dependency STDIO Model Context Protocol (MCP) server for Google Antigravi
 that connects to a specific Gemini Enterprise (Agentspace / Discovery Engine) instance
 and dynamically routes tool discovery, action execution, and grounded search strictly
 across the connectors and data stores bound to that Engine ID.
+
+API Version Notes:
+  - Engine metadata (`engines/{id}`) and grounded assistant queries (`:streamAssist`)
+    use the General Availability `v1` Discovery Engine API.
+  - Connector MCP invocation (`dataConnector:invokeConnectorMcp`) and widget/connector
+    action state metadata (`widgetConfigs`, `dataConnector`) currently require `v1alpha`
+    (tested against `v1` and `v1beta`, which return HTTP 404 for `:invokeConnectorMcp`).
 """
 
 import argparse
+import datetime
 import json
 import os
 import shutil
@@ -21,11 +29,11 @@ import urllib.request
 from typing import Any
 
 
-def _api_base(location: str) -> str:
+def _api_base(location: str, version: str = "v1") -> str:
     loc = (location or "global").strip().lower()
     if loc in ("us", "eu"):
-        return f"https://{loc}-discoveryengine.googleapis.com/v1alpha"
-    return "https://discoveryengine.googleapis.com/v1alpha"
+        return f"https://{loc}-discoveryengine.googleapis.com/{version}"
+    return f"https://discoveryengine.googleapis.com/{version}"
 
 
 def _build_ssl_context() -> ssl.SSLContext:
@@ -149,6 +157,134 @@ def clean_collection_id(connector: str) -> str:
     return connector.removeprefix("collections/").strip()
 
 
+def resolve_engine_and_location(
+    project: str, req_engine: str = "", req_location: str = ""
+) -> tuple[str, str, str]:
+    """
+    Resolves or validates (engine_id, location, display_name) using the GA v1
+    Discovery Engine API across global, us, and eu.
+    """
+    req_engine = (req_engine or "").strip()
+    req_location = (req_location or "").strip().lower()
+    locations_to_scan = [req_location] if req_location else ["global", "us", "eu"]
+
+    if req_engine:
+        for loc in locations_to_scan:
+            url = (
+                f"{_api_base(loc, 'v1')}/projects/{project}/locations/{loc}/"
+                f"collections/default_collection/engines/{req_engine}"
+            )
+            code, data = de_request("GET", url, project, timeout=20)
+            if code == 200 and isinstance(data, dict) and data.get("name"):
+                return req_engine, loc, data.get("displayName", req_engine)
+
+        other_locs = [l for l in ("global", "us", "eu") if l not in locations_to_scan]
+        for loc in other_locs:
+            url = (
+                f"{_api_base(loc, 'v1')}/projects/{project}/locations/{loc}/"
+                f"collections/default_collection/engines/{req_engine}"
+            )
+            code, data = de_request("GET", url, project, timeout=20)
+            if code == 200 and isinstance(data, dict) and data.get("name"):
+                sys.stderr.write(
+                    f"WARN: Engine '{req_engine}' was not found in location '{req_location}', "
+                    f"but WAS found in location '{loc}'. Using location='{loc}'.\n"
+                )
+                return req_engine, loc, data.get("displayName", req_engine)
+
+        if req_location:
+            return req_engine, req_location, req_engine
+        raise RuntimeError(
+            f"Could not find Gemini Enterprise engine '{req_engine}' in project '{project}' "
+            "across locations: global, us, eu."
+        )
+
+    found: list[tuple[str, str, str, str]] = []
+    for loc in locations_to_scan:
+        url = (
+            f"{_api_base(loc, 'v1')}/projects/{project}/locations/{loc}/"
+            "collections/default_collection/engines"
+        )
+        code, data = de_request("GET", url, project, timeout=20)
+        if code == 200 and isinstance(data, dict):
+            for eng in data.get("engines", []):
+                eid = eng.get("name", "").split("/")[-1]
+                if eid:
+                    found.append(
+                        (
+                            eid,
+                            loc,
+                            eng.get("displayName", eid),
+                            eng.get("solutionType", ""),
+                        )
+                    )
+
+    if not found:
+        raise RuntimeError(
+            f"No Gemini Enterprise engines found in project '{project}' "
+            f"(scanned locations: {', '.join(locations_to_scan)})."
+        )
+    if len(found) == 1:
+        eid, loc, dname, _ = found[0]
+        return eid, loc, dname
+
+    lines = ["Multiple Gemini Enterprise engines found in project:"]
+    for eid, loc, dname, stype in found:
+        lines.append(f"  --engine {eid} --location {loc}   ({dname}) [{stype}]")
+    raise RuntimeError("\n".join(lines))
+
+
+def write_dynamic_mcp_configs(
+    project: str, engine: str, location: str, server_name: str = "gemini-enterprise"
+) -> list[str]:
+    """
+    Safely merges the dynamic $HOME/$PATH 'gemini-enterprise' MCP server entry into
+    ~/.gemini/config/mcp_config.json and ~/.gemini/antigravity/mcp_config.json.
+    """
+    config_paths = [
+        os.path.expanduser("~/.gemini/config/mcp_config.json"),
+        os.path.expanduser("~/.gemini/antigravity/mcp_config.json"),
+    ]
+    server_entry = {
+        "command": "sh",
+        "args": [
+            "-c",
+            'PATH="$HOME/google-cloud-sdk/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" exec python3 "$HOME/.gemini/config/ge_mcp_server.py"',
+        ],
+        "env": {
+            "GE_MCP_PROJECT": str(project),
+            "GE_MCP_ENGINE": str(engine),
+            "GE_MCP_LOCATION": str(location),
+            "PYTHONUNBUFFERED": "1",
+        },
+    }
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    updated: list[str] = []
+
+    for cfg_path in config_paths:
+        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        data: dict[str, Any] = {"mcpServers": {}}
+        if os.path.exists(cfg_path):
+            backup_path = f"{cfg_path}.bak_{timestamp}"
+            shutil.copy2(cfg_path, backup_path)
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+            except Exception:
+                pass
+        if "mcpServers" not in data or not isinstance(data["mcpServers"], dict):
+            data["mcpServers"] = {}
+
+        data["mcpServers"][server_name] = server_entry
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        updated.append(cfg_path)
+    return updated
+
+
 def discover_engine_bound_resources(
     project: str,
     location: str,
@@ -166,9 +302,11 @@ def discover_engine_bound_resources(
     ):
         return _ENGINE_SCOPE_CACHE["data"]
 
-    base = f"{_api_base(location)}/projects/{project}/locations/{location}"
-    eng_url = f"{base}/collections/default_collection/engines/{engine_id}"
-    widget_url = f"{eng_url}/widgetConfigs/default_search_widget_config"
+    base_v1 = f"{_api_base(location, 'v1')}/projects/{project}/locations/{location}"
+    base_v1alpha = f"{_api_base(location, 'v1alpha')}/projects/{project}/locations/{location}"
+
+    eng_url = f"{base_v1}/collections/default_collection/engines/{engine_id}"
+    widget_url = f"{base_v1alpha}/collections/default_collection/engines/{engine_id}/widgetConfigs/default_search_widget_config"
 
     eng_code, eng_data = de_request("GET", eng_url, project, timeout=timeout)
     wid_code, wid_data = de_request("GET", widget_url, project, timeout=timeout)
@@ -212,7 +350,7 @@ def discover_engine_bound_resources(
             }
 
     for cid, info in list(connectors_by_id.items()):
-        dc_url = f"{base}/collections/{cid}/dataConnector"
+        dc_url = f"{base_v1alpha}/collections/{cid}/dataConnector"
         dc_code, dc_data = de_request("GET", dc_url, project, timeout=timeout)
         if dc_code == 200 and isinstance(dc_data, dict):
             enabled_actions = dc_data.get("bapConfig", {}).get("enabledActions", [])
@@ -297,8 +435,9 @@ def invoke_connector_mcp(
     timeout: int = 60,
 ) -> tuple[int, Any]:
     col_id = clean_collection_id(connector_id)
+    # :invokeConnectorMcp currently requires v1alpha (returns 404 in v1/v1beta)
     url = (
-        f"{_api_base(location)}/projects/{project}/locations/{location}/"
+        f"{_api_base(location, 'v1alpha')}/projects/{project}/locations/{location}/"
         f"collections/{col_id}/dataConnector:invokeConnectorMcp"
     )
     body = {k: v for k, v in mcp_payload.items() if k not in ("jsonrpc", "id")}
@@ -352,7 +491,7 @@ def build_meta_tools(
             "name": "ge_list_connectors",
             "description": (
                 f"List ONLY the connectors and search data stores attached to Gemini Enterprise "
-                f"instance '{engine_id}' (project '{project}'). Unlinked project connectors are hidden."
+                f"instance '{engine_id}' (project '{project}', location '{location}'). Unlinked project connectors are hidden."
             ),
             "inputSchema": {
                 "type": "object",
@@ -557,8 +696,9 @@ def handle_tool_call(
 
         if name == "ge_assist_query":
             query_text = arguments.get("query", "")
+            # :streamAssist is available on the GA v1 endpoint
             url = (
-                f"{_api_base(location)}/projects/{project}/locations/{location}/"
+                f"{_api_base(location, 'v1')}/projects/{project}/locations/{location}/"
                 f"collections/default_collection/engines/{engine_id}/"
                 f"assistants/default_assistant:streamAssist"
             )
@@ -616,13 +756,23 @@ def main() -> None:
     )
     parser.add_argument(
         "--location",
-        default=os.environ.get("GE_MCP_LOCATION", "global"),
-        help="Discovery Engine location: global, us, or eu (default: global)",
+        default=os.environ.get("GE_MCP_LOCATION", ""),
+        help="Location of the Gemini Enterprise instance: global, us, or eu (or set GE_MCP_LOCATION env var)",
     )
     parser.add_argument(
         "--engine",
         default=os.environ.get("GE_MCP_ENGINE", ""),
         help="Gemini Enterprise Engine ID to scope connectors and data stores to (or set GE_MCP_ENGINE env var)",
+    )
+    parser.add_argument(
+        "--resolve-engine",
+        action="store_true",
+        help="Resolve/validate engine ID and its location via Discovery Engine v1 API and print ENGINE|LOCATION|DISPLAY_NAME",
+    )
+    parser.add_argument(
+        "--write-mcp-config",
+        action="store_true",
+        help="Write the dynamic $HOME/$PATH 'gemini-enterprise' entry into ~/.gemini/config/mcp_config.json and ~/.gemini/antigravity/mcp_config.json",
     )
     parser.add_argument(
         "--call-tool",
@@ -641,11 +791,32 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not args.project or not args.engine:
-        sys.stderr.write(
-            "ERROR: Both --project (or GE_MCP_PROJECT) and --engine (or GE_MCP_ENGINE) are required.\n"
-        )
+    if not args.project:
+        sys.stderr.write("ERROR: --project (or GE_MCP_PROJECT) is required.\n")
         sys.exit(1)
+
+    if args.resolve_engine:
+        try:
+            eid, loc, dname = resolve_engine_and_location(
+                args.project, args.engine, args.location
+            )
+            print(f"{eid}|{loc}|{dname}")
+            return
+        except Exception as e:
+            sys.stderr.write(f"ERROR: {e}\n")
+            sys.exit(2)
+
+    location = args.location or "global"
+
+    if not args.engine:
+        sys.stderr.write("ERROR: --engine (or GE_MCP_ENGINE) is required.\n")
+        sys.exit(1)
+
+    if args.write_mcp_config:
+        updated = write_dynamic_mcp_configs(args.project, args.engine, location)
+        for p in updated:
+            print(f"      Updated {p}")
+        return
 
     if args.call_tool:
         if args.tool_args_file:
@@ -657,7 +828,7 @@ def main() -> None:
             args.call_tool,
             tool_args,
             args.project,
-            args.location,
+            location,
             args.engine,
         )
         print(json.dumps(res, indent=2))
@@ -695,7 +866,7 @@ def main() -> None:
         elif method == "ping":
             send_response(msg_id, {})
         elif method == "tools/list":
-            tools = build_meta_tools(args.project, args.location, args.engine)
+            tools = build_meta_tools(args.project, location, args.engine)
             send_response(msg_id, {"tools": tools})
         elif method == "tools/call":
             tool_name = params.get("name", "")
@@ -704,7 +875,7 @@ def main() -> None:
                 tool_name,
                 tool_args,
                 args.project,
-                args.location,
+                location,
                 args.engine,
             )
             send_response(msg_id, res)
