@@ -1,3 +1,19 @@
+<!--
+Copyright 2026 Carlos Augusto
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
 # Engine-Scoped Gemini Enterprise MCP Router for Antigravity (AGY)
 
 A zero-dependency Python 3 Model Context Protocol (MCP) server (`ge_mcp_server.py`) that connects **Google Antigravity (AGY)** directly to all data connectors and search data stores bound to a specific **Gemini Enterprise (Agentspace / Discovery Engine)** instance.
@@ -38,6 +54,7 @@ flowchart LR
 | [`ge_mcp_server.py`](./ge_mcp_server.py) | Zero-dependency Python 3 MCP server implementing the 4 engine-scoped meta-tools (`ge_list_connectors`, `ge_search_tools`, `ge_call_tool`, `ge_assist_query`). Dynamically locates `gcloud` across macOS and Linux paths. |
 | [`install_ge_mcp.sh`](./install_ge_mcp.sh) | Automated installer script that detects `python3` and `gcloud`, discovers or validates `--engine` and its `--location`, installs `ge_mcp_server.py` into `$HOME/.gemini/config/`, safely merges `mcp_config.json`, and runs a live smoke test. |
 | [`mcp_config.example.json`](./mcp_config.example.json) | Portable, OS-agnostic `mcp_config.json` template using `$HOME` runtime expansion (no hardcoded `/Users/...` or `/home/...` paths). |
+| [`LICENSE`](./LICENSE) | Standard Apache License, Version 2.0 text. |
 | [`legacy_v1/ge_mcp_server.v1_backup.py`](./legacy_v1/ge_mcp_server.v1_backup.py) | Backup of the initial `v1` single-connector MCP server design. |
 
 ---
@@ -222,3 +239,13 @@ Because all bound connectors sit behind the single `gemini-enterprise` MCP serve
   - *"Search our enterprise documents for the 'Q4 Platform Reliability Spec', extract the action items, and create Jira tasks for them."*
 - **BigQuery Metrics -> Jira / Outlook Report:**
   - *"Run a query on our BigQuery connector to check yesterday's failed job count, and if there are failures, create a High-priority Jira bug and email the summary via Outlook."*
+
+---
+
+## 8. License
+
+Licensed under the **Apache License, Version 2.0** (the "License"); you may not use this project except in compliance with the License. A full copy of the License is available in [`LICENSE`](./LICENSE) or at:
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
