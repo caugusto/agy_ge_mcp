@@ -16,6 +16,7 @@ API Version Notes:
 """
 
 import argparse
+import concurrent.futures
 import datetime
 import html
 import json
@@ -310,8 +311,11 @@ def discover_engine_bound_resources(
     eng_url = f"{base_v1}/collections/default_collection/engines/{engine_id}"
     widget_url = f"{base_v1alpha}/collections/default_collection/engines/{engine_id}/widgetConfigs/default_search_widget_config"
 
-    eng_code, eng_data = de_request("GET", eng_url, project, timeout=timeout)
-    wid_code, wid_data = de_request("GET", widget_url, project, timeout=timeout)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f_eng = pool.submit(de_request, "GET", eng_url, project, None, timeout)
+        f_wid = pool.submit(de_request, "GET", widget_url, project, None, timeout)
+        eng_code, eng_data = f_eng.result()
+        wid_code, wid_data = f_wid.result()
 
     bound_datastore_ids: list[str] = (
         eng_data.get("dataStoreIds", [])
@@ -351,7 +355,8 @@ def discover_engine_bound_resources(
                 "boundDataStores": ds_comps,
             }
 
-    for cid, info in list(connectors_by_id.items()):
+    def _fetch_connector_meta(cid_and_info: tuple[str, dict[str, Any]]) -> None:
+        cid, info = cid_and_info
         dc_url = f"{base_v1alpha}/collections/{cid}/dataConnector"
         dc_code, dc_data = de_request("GET", dc_url, project, timeout=timeout)
         if dc_code == 200 and isinstance(dc_data, dict):
@@ -361,6 +366,12 @@ def discover_engine_bound_resources(
             info["connectorModes"] = dc_data.get("connectorModes", [])
             info["enabledActionsCount"] = len(enabled_actions)
             info["enabledActions"] = enabled_actions
+
+    if connectors_by_id:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(8, len(connectors_by_id))
+        ) as pool:
+            list(pool.map(_fetch_connector_meta, list(connectors_by_id.items())))
 
     bound_search_datastores = [
         ds_id for ds_id in bound_datastore_ids if ds_id not in consumed_datastores
@@ -655,18 +666,19 @@ def build_meta_tools(
     project: str, location: str, engine_id: str
 ) -> list[dict[str, Any]]:
     connector_summary = "call `ge_list_connectors` to view bound connectors"
-    try:
-        scope = discover_engine_bound_resources(
-            project, location, engine_id, timeout=6
-        )
-        conns = scope.get("connectors", [])
+    cache_key = f"{project}:{location}:{engine_id}"
+    cached_scope = (
+        _ENGINE_SCOPE_CACHE.get("data")
+        if _ENGINE_SCOPE_CACHE.get("key") == cache_key
+        else None
+    )
+    if isinstance(cached_scope, dict):
+        conns = cached_scope.get("connectors", [])
         if conns:
             connector_summary = ", ".join(
                 f"{c['connectorId']} ({c.get('dataSourceDisplayName') or c.get('dataSource')})"
                 for c in conns
             )
-    except Exception:
-        pass
 
     connector_prop: dict[str, Any] = {
         "type": "string",
@@ -879,6 +891,130 @@ _FALLBACK_CONNECTOR_TOOLS: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 
+def _enrich_epoch_timestamps(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            out[k] = _enrich_epoch_timestamps(v)
+            if (
+                k in ("start_time", "end_time", "create_time", "update_time")
+                and isinstance(v, (int, float))
+                and v > 1_000_000_000
+            ):
+                try:
+                    dt_utc = datetime.datetime.fromtimestamp(
+                        v, tz=datetime.timezone.utc
+                    )
+                    out[f"{k}_utc"] = dt_utc.isoformat()
+                except Exception:
+                    pass
+        return out
+    if isinstance(obj, list):
+        return [_enrich_epoch_timestamps(x) for x in obj]
+    return obj
+
+
+def execute_federated_datastore_search(
+    project: str,
+    location: str,
+    engine_id: str,
+    connector_id: str,
+    tool_args: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Federated search tools (`search_calendar_tool`, `search_email_tool`, etc.)
+    fail inside `:invokeConnectorMcp` with `ValueError: Search engine id is empty`
+    because `:invokeConnectorMcp` does not inject the internal Vertex AI Search
+    `tool_context` used by `:streamAssist`.
+    Instead, querying `collections/default_collection/dataStores/{ds_id}/servingConfigs/default_search:search`
+    executes the federated search directly against the connector's bound dataStore(s)
+    in a single fast round-trip.
+    """
+    scope = discover_engine_bound_resources(project, location, engine_id)
+    conn_info = next(
+        (c for c in scope.get("connectors", []) if c["connectorId"] == connector_id),
+        {},
+    )
+    bound_ds_ids = conn_info.get("boundDataStores") or []
+    if not bound_ds_ids:
+        return {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"No bound dataStores found for connector '{connector_id}'.",
+                }
+            ],
+        }
+
+    queries = tool_args.get("queries")
+    if isinstance(queries, str):
+        query_list = [queries]
+    elif isinstance(queries, list) and queries:
+        query_list = [str(q) for q in queries]
+    elif isinstance(tool_args.get("query"), str):
+        query_list = [tool_args["query"]]
+    else:
+        query_list = [""]
+
+    page_size = int(tool_args.get("pageSize") or tool_args.get("maxResults") or 25)
+    base_v1alpha = f"{_api_base(location, 'v1alpha')}/projects/{project}/locations/{location}"
+
+    all_query_results: list[dict[str, Any]] = []
+    for ds_id in bound_ds_ids:
+        search_url = (
+            f"{base_v1alpha}/collections/default_collection/"
+            f"dataStores/{ds_id}/servingConfigs/default_search:search"
+        )
+        for q in query_list:
+            code, data = de_request(
+                "POST",
+                search_url,
+                project,
+                body={"query": q, "pageSize": page_size},
+                timeout=30,
+            )
+            items = []
+            if code == 200 and isinstance(data, dict):
+                for r in data.get("results", []):
+                    doc = r.get("document", {})
+                    struct = _enrich_epoch_timestamps(
+                        doc.get("derivedStructData") or doc.get("structData") or {}
+                    )
+                    items.append(
+                        {
+                            "id": doc.get("id") or r.get("id"),
+                            "data": struct,
+                        }
+                    )
+            all_query_results.append(
+                {
+                    "dataStoreId": ds_id,
+                    "query": q,
+                    "statusCode": code,
+                    "matchingCount": len(items),
+                    "results": items,
+                }
+            )
+
+    return {
+        "isError": False,
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "connectorId": connector_id,
+                        "queriesExecuted": len(all_query_results),
+                        "searchResults": all_query_results,
+                    },
+                    indent=2,
+                ),
+            }
+        ],
+    }
+
+
 def handle_tool_call(
     name: str,
     arguments: dict[str, Any],
@@ -1001,6 +1137,12 @@ def handle_tool_call(
             tool_name = arguments.get("tool_name", "")
             tool_args = dict(arguments.get("arguments") or {})
 
+            # Fast-path federated dataStore search for `search_calendar_tool` / `search_email_tool`
+            if tool_name in ("search_calendar_tool", "search_email_tool"):
+                return execute_federated_datastore_search(
+                    project, location, engine_id, cid, tool_args
+                )
+
             if tool_name in ("send_message", "reply_to_mail_message") and isinstance(
                 tool_args.get("Content"), str
             ):
@@ -1019,6 +1161,13 @@ def handle_tool_call(
             )
             if code == 200 and isinstance(data, dict) and "result" in data:
                 res = data["result"]
+                if (
+                    isinstance(res, dict)
+                    and "Search engine id is empty" in str(res.get("error", ""))
+                ):
+                    return execute_federated_datastore_search(
+                        project, location, engine_id, cid, tool_args
+                    )
                 if isinstance(res, dict) and "content" in res:
                     return res
             return {
@@ -1028,6 +1177,39 @@ def handle_tool_call(
 
         if name == "ge_assist_query":
             query_text = arguments.get("query", "")
+            scope = discover_engine_bound_resources(project, location, engine_id)
+            ds_specs: list[dict[str, str]] = []
+            seen_ds: set[str] = set()
+            for c in scope.get("connectors", []):
+                for ds_id in c.get("boundDataStores", []):
+                    if ds_id and ds_id not in seen_ds:
+                        seen_ds.add(ds_id)
+                        ds_specs.append(
+                            {
+                                "dataStore": (
+                                    f"projects/{project}/locations/{location}/"
+                                    f"collections/default_collection/dataStores/{ds_id}"
+                                )
+                            }
+                        )
+            for ds_id in scope.get("boundSearchDataStores", []):
+                if ds_id and ds_id not in seen_ds:
+                    seen_ds.add(ds_id)
+                    ds_specs.append(
+                        {
+                            "dataStore": (
+                                f"projects/{project}/locations/{location}/"
+                                f"collections/default_collection/dataStores/{ds_id}"
+                            )
+                        }
+                    )
+
+            assist_body: dict[str, Any] = {"query": {"text": query_text}}
+            if ds_specs:
+                assist_body["toolsSpec"] = {
+                    "vertexAiSearchSpec": {"dataStoreSpecs": ds_specs}
+                }
+
             # :streamAssist is available on the GA v1 endpoint
             url = (
                 f"{_api_base(location, 'v1')}/projects/{project}/locations/{location}/"
@@ -1038,9 +1220,38 @@ def handle_tool_call(
                 "POST",
                 url,
                 project,
-                body={"query": {"text": query_text}},
+                body=assist_body,
                 timeout=90,
             )
+            if code == 200 and isinstance(data, list):
+                text_parts: list[str] = []
+                for chunk in data:
+                    if not isinstance(chunk, dict):
+                        continue
+                    for rep in chunk.get("answer", {}).get("replies", []):
+                        txt = (
+                            rep.get("groundedContent", {})
+                            .get("content", {})
+                            .get("text")
+                        )
+                        if isinstance(txt, str):
+                            text_parts.append(txt)
+                if text_parts:
+                    return {
+                        "isError": False,
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(
+                                    {
+                                        "engineId": engine_id,
+                                        "answerText": "".join(text_parts).strip(),
+                                    },
+                                    indent=2,
+                                ),
+                            }
+                        ],
+                    }
             return {
                 "isError": code != 200,
                 "content": [{"type": "text", "text": json.dumps(data, indent=2)}],
