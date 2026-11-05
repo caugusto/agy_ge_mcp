@@ -17,8 +17,10 @@ API Version Notes:
 
 import argparse
 import datetime
+import html
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -450,8 +452,10 @@ def _normalize_json_schema(schema: Any) -> Any:
     out = dict(schema)
     t = out.get("type")
     if isinstance(t, list):
-        non_null = [x for x in t if x != "null"]
+        non_null = [str(x).lower() for x in t if x != "null"]
         out["type"] = non_null[0] if non_null else "string"
+    elif isinstance(t, str):
+        out["type"] = t.lower()
     if isinstance(out.get("properties"), dict):
         out["properties"] = {
             k: _normalize_json_schema(v) for k, v in out["properties"].items()
@@ -459,6 +463,192 @@ def _normalize_json_schema(schema: Any) -> Any:
     if isinstance(out.get("items"), dict):
         out["items"] = _normalize_json_schema(out["items"])
     return out
+
+
+_HTML_TAG_RE = re.compile(
+    r"<\s*(?:html|body|div|p|br|ul|ol|li|table|thead|tbody|tr|th|td|h[1-6]|strong|b|em|i|a|span|pre|code|hr|blockquote)\b",
+    re.IGNORECASE,
+)
+
+
+def _format_inline_html(text: str) -> str:
+    escaped = html.escape(text)
+    link_placeholders: list[str] = []
+
+    def _save_md_link(m: re.Match[str]) -> str:
+        label, url = m.group(1), m.group(2)
+        idx = len(link_placeholders)
+        link_placeholders.append(
+            f'<a href="{url}" style="color:#1a73e8;text-decoration:none;">{label}</a>'
+        )
+        return f"@@MDLINK_{idx}@@"
+
+    escaped = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)", _save_md_link, escaped
+    )
+    escaped = re.sub(
+        r"(https?://[^\s<]+)",
+        lambda m: (
+            f'<a href="{m.group(1).rstrip(".,;:)")}" style="color:#1a73e8;text-decoration:none;">'
+            f'{m.group(1).rstrip(".,;:)")}</a>'
+            + m.group(1)[len(m.group(1).rstrip(".,;:)")) :]
+        ),
+        escaped,
+    )
+    for idx, anchor in enumerate(link_placeholders):
+        escaped = escaped.replace(f"@@MDLINK_{idx}@@", anchor)
+
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(
+        r"`([^`]+)`",
+        r'<code style="background:#f1f3f4;padding:1px 4px;border-radius:3px;font-family:monospace;">\1</code>',
+        escaped,
+    )
+    return escaped
+
+
+def format_email_content_as_html(content: str) -> str:
+    """
+    Gmail's Discovery Engine connector (`send_message` / `reply_to_mail_message`)
+    sends emails with `Content-Type: text/html; charset=UTF-8`. If a caller passes
+    plain text or Markdown without HTML tags, Gmail collapses all newlines into a
+    single unformatted line. This helper converts plain text / Markdown into clean,
+    readable HTML while leaving existing HTML untouched.
+    """
+    if not content or not isinstance(content, str):
+        return content
+    if _HTML_TAG_RE.search(content):
+        return content
+
+    lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    html_parts: list[str] = [
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#202124;">'
+    ]
+    in_ul = False
+    in_ol = False
+
+    def _close_lists() -> None:
+        nonlocal in_ul, in_ol
+        if in_ul:
+            html_parts.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html_parts.append("</ol>")
+            in_ol = False
+
+    i = 0
+    while i < len(lines):
+        raw_line = lines[i]
+        stripped = raw_line.strip()
+
+        if not stripped:
+            _close_lists()
+            i += 1
+            continue
+
+        # Markdown table detection
+        if (
+            "|" in stripped
+            and i + 1 < len(lines)
+            and re.match(r"^\s*\|?[\s:-]+\|[\s|:-]*$", lines[i + 1])
+        ):
+            _close_lists()
+            headers = [
+                c.strip() for c in stripped.strip("|").split("|")
+            ]
+            html_parts.append(
+                '<table style="border-collapse:collapse;width:100%;margin:12px 0;font-size:13px;">'
+                "<thead><tr>"
+            )
+            for h in headers:
+                html_parts.append(
+                    f'<th style="border:1px solid #dadce0;background:#f8f9fa;padding:8px 10px;text-align:left;font-weight:600;">{_format_inline_html(h)}</th>'
+                )
+            html_parts.append("</tr></thead><tbody>")
+            i += 2
+            while i < len(lines) and "|" in lines[i].strip():
+                row_cells = [
+                    c.strip() for c in lines[i].strip().strip("|").split("|")
+                ]
+                html_parts.append("<tr>")
+                for c in row_cells:
+                    html_parts.append(
+                        f'<td style="border:1px solid #dadce0;padding:8px 10px;vertical-align:top;">{_format_inline_html(c)}</td>'
+                    )
+                html_parts.append("</tr>")
+                i += 1
+            html_parts.append("</tbody></table>")
+            continue
+
+        # Headings
+        heading_match = re.match(r"^(#{1,4})\s+(.+)$", stripped)
+        if heading_match:
+            _close_lists()
+            level = len(heading_match.group(1))
+            sizes = {1: "18px", 2: "16px", 3: "15px", 4: "14px"}
+            html_parts.append(
+                f'<h{level} style="font-size:{sizes.get(level, "14px")};margin:14px 0 6px 0;color:#202124;">'
+                f"{_format_inline_html(heading_match.group(2))}</h{level}>"
+            )
+            i += 1
+            continue
+
+        # Ordered list item
+        ol_match = re.match(r"^(\d+)[.)]\s+(.+)$", stripped)
+        if ol_match:
+            if in_ul:
+                html_parts.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                html_parts.append('<ol style="margin:8px 0;padding-left:22px;">')
+                in_ol = True
+            item_html = _format_inline_html(ol_match.group(2))
+            sub_items: list[str] = []
+            while i + 1 < len(lines):
+                next_line = lines[i + 1]
+                sub_match = re.match(r"^\s{2,}[-*•]\s+(.+)$", next_line)
+                if sub_match:
+                    sub_items.append(
+                        f'<li style="margin:2px 0;">{_format_inline_html(sub_match.group(1))}</li>'
+                    )
+                    i += 1
+                else:
+                    break
+            if sub_items:
+                item_html += (
+                    '<ul style="margin:4px 0 6px 0;padding-left:18px;">'
+                    + "".join(sub_items)
+                    + "</ul>"
+                )
+            html_parts.append(f'<li style="margin:6px 0;">{item_html}</li>')
+            i += 1
+            continue
+
+        # Unordered list item
+        ul_match = re.match(r"^[-*•]\s+(.+)$", stripped)
+        if ul_match:
+            if in_ol:
+                html_parts.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                html_parts.append('<ul style="margin:8px 0;padding-left:22px;">')
+                in_ul = True
+            html_parts.append(
+                f'<li style="margin:4px 0;">{_format_inline_html(ul_match.group(1))}</li>'
+            )
+            i += 1
+            continue
+
+        # Standard paragraph
+        _close_lists()
+        html_parts.append(
+            f'<p style="margin:8px 0;">{_format_inline_html(stripped)}</p>'
+        )
+        i += 1
+
+    _close_lists()
+    html_parts.append("</div>")
+    return "".join(html_parts)
 
 
 def build_meta_tools(
@@ -574,6 +764,121 @@ def build_meta_tools(
     ]
 
 
+_FALLBACK_CONNECTOR_TOOLS: dict[str, dict[str, dict[str, Any]]] = {
+    "google_mail": {
+        "send_message": {
+            "name": "send_message",
+            "description": (
+                "Send an email message to one or more recipients using Gmail. "
+                "Supports plain text, Markdown, or HTML in `Content` (plain text and Markdown "
+                "are automatically converted to clean HTML so line breaks and formatting are preserved)."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["To", "Subject", "Content"],
+                "properties": {
+                    "To": {
+                        "type": "string",
+                        "description": "Primary recipient email address(es), comma-separated.",
+                    },
+                    "Subject": {
+                        "type": "string",
+                        "description": "Subject line for the email.",
+                    },
+                    "Content": {
+                        "type": "string",
+                        "description": "Main body content of the email (HTML, Markdown, or multi-line plain text).",
+                    },
+                    "CC": {
+                        "type": "string",
+                        "description": "Optional CC recipient email address(es), comma-separated.",
+                    },
+                    "BCC": {
+                        "type": "string",
+                        "description": "Optional BCC recipient email address(es), comma-separated.",
+                    },
+                    "AttachmentFileName": {
+                        "type": "string",
+                        "description": "Optional attachment file name (e.g. 'report.pdf').",
+                    },
+                    "AttachmentContent": {
+                        "type": "string",
+                        "description": "Optional text content for a single text attachment.",
+                    },
+                    "AttachmentContentBytes": {
+                        "type": "string",
+                        "description": "Optional Base64-encoded binary content for a single attachment.",
+                    },
+                    "AttachmentHasBytes": {
+                        "type": "boolean",
+                        "description": "Set true when providing AttachmentContentBytes, false for AttachmentContent.",
+                    },
+                },
+            },
+        },
+        "reply_to_mail_message": {
+            "name": "reply_to_mail_message",
+            "description": (
+                "Send a reply to a specific email message in Gmail identified by its `MessageId`. "
+                "Supports plain text, Markdown, or HTML in `Content`."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["MessageId", "To", "Content"],
+                "properties": {
+                    "MessageId": {
+                        "type": "string",
+                        "description": "Unique identifier of the email message being replied to.",
+                    },
+                    "To": {
+                        "type": "string",
+                        "description": "Primary recipient(s) of the email reply, comma-separated.",
+                    },
+                    "Content": {
+                        "type": "string",
+                        "description": "Main body of the email reply (HTML, Markdown, or multi-line plain text).",
+                    },
+                    "CC": {
+                        "type": "string",
+                        "description": "Optional CC recipient(s), comma-separated.",
+                    },
+                    "BCC": {
+                        "type": "string",
+                        "description": "Optional BCC recipient(s), comma-separated.",
+                    },
+                    "From": {
+                        "type": "string",
+                        "description": "Optional sender email address.",
+                    },
+                },
+            },
+        },
+        "create_label": {
+            "name": "create_label",
+            "description": "Create a new organizational label in Gmail.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["Name"],
+                "properties": {
+                    "Name": {
+                        "type": "string",
+                        "description": "Display name of the label.",
+                    },
+                    "LabelListVisibility": {
+                        "type": "string",
+                        "description": "Acceptable values: LabelHide, LabelShow, LabelShowIfUnread.",
+                    },
+                    "MessageListVisibility": {
+                        "type": "string",
+                        "description": "Acceptable values: HIDE, SHOW.",
+                    },
+                },
+            },
+        },
+    }
+}
+
+
 def handle_tool_call(
     name: str,
     arguments: dict[str, Any],
@@ -618,9 +923,26 @@ def handle_tool_call(
                     "content": [{"type": "text", "text": json.dumps(data, indent=2)}],
                 }
 
-            raw_tools = (
+            raw_tools = list(
                 data.get("result", {}).get("tools") or data.get("tools") or []
             )
+            existing_names = {
+                t.get("name") for t in raw_tools if isinstance(t, dict) and t.get("name")
+            }
+
+            scope = discover_engine_bound_resources(project, location, engine_id)
+            conn_info = next(
+                (c for c in scope.get("connectors", []) if c["connectorId"] == cid),
+                {},
+            )
+            data_source = conn_info.get("dataSource", "")
+            enabled_actions = conn_info.get("enabledActions", [])
+            fallbacks = _FALLBACK_CONNECTOR_TOOLS.get(data_source, {})
+            for act in enabled_actions:
+                if act not in existing_names and act in fallbacks:
+                    raw_tools.append(fallbacks[act])
+                    existing_names.add(act)
+
             matched = []
             for t in raw_tools:
                 if not isinstance(t, dict) or not t.get("name"):
@@ -638,10 +960,12 @@ def handle_tool_call(
                     "description": t_desc,
                 }
                 if include_schemas:
-                    entry["inputSchema"] = _normalize_json_schema(
+                    raw_schema = (
                         t.get("inputSchema")
+                        or t.get("parameters")
                         or {"type": "object", "properties": {}}
                     )
+                    entry["inputSchema"] = _normalize_json_schema(raw_schema)
                 matched.append(entry)
 
             return {
@@ -675,7 +999,15 @@ def handle_tool_call(
                 }
 
             tool_name = arguments.get("tool_name", "")
-            tool_args = arguments.get("arguments") or {}
+            tool_args = dict(arguments.get("arguments") or {})
+
+            if tool_name in ("send_message", "reply_to_mail_message") and isinstance(
+                tool_args.get("Content"), str
+            ):
+                tool_args["Content"] = format_email_content_as_html(
+                    tool_args["Content"]
+                )
+
             code, data = invoke_connector_mcp(
                 project,
                 location,
