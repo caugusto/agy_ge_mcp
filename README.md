@@ -144,9 +144,14 @@ bash install_ge_mcp.sh \
 
 ---
 
-## 5. What Needs to Be Updated for Another Environment?
+## 5. What Needs to Be Updated for Another Environment? *(Option B / Manual Config Only)*
 
-Because `command` and `args` use runtime `$HOME` and `$PATH` expansion (and `ge_mcp_server.py` auto-discovers `gcloud` via `shutil.which("gcloud")` and `os.path.expanduser("~")`), **no filesystem paths need to be edited**. Only the **3 environment variables** in `env` change per Gemini Enterprise environment:
+> [!NOTE]
+> **Only Applicable to Option B (Manual Setup):** If you used **Option A (`install_ge_mcp.sh`)**, you can skip this section—the installer automatically resolves and writes `GE_MCP_PROJECT`, `GE_MCP_ENGINE`, and `GE_MCP_LOCATION` into `mcp_config.json` for you (and you can switch environments anytime by re-running `bash install_ge_mcp.sh --project <NEW_PROJECT>`).
+>
+> The table below applies **only** if you chose **Option B: Manual Setup (100% Dynamic Paths)** or want to edit `mcp_config.json` by hand.
+
+Because `command` and `args` use runtime `$HOME` and `$PATH` expansion (and `ge_mcp_server.py` auto-discovers `gcloud` via `shutil.which("gcloud")` and `os.path.expanduser("~")`), **no filesystem paths ever need to be edited**. When configuring `mcp_config.json` manually under **Option B**, only the **3 environment variables** in `env` change per Gemini Enterprise environment:
 
 | Environment Variable in `mcp_config.json` | Required | Description | How to Find It |
 | :--- | :--- | :--- | :--- |
