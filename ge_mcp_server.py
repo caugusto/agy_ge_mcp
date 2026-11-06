@@ -92,20 +92,104 @@ def _discover_gcloud_candidates() -> list[str]:
     return candidates
 
 
-_TOKEN_CACHE: dict[str, Any] = {"token": "", "expires_at": 0.0}
+_TOKEN_CACHE: dict[str, Any] = {
+    "token": "",
+    "email": "",
+    "sub": "",
+    "expires_at": 0.0,
+}
 _ENGINE_SCOPE_CACHE: dict[str, Any] = {"key": "", "data": None, "expires_at": 0.0}
 
+# Environment variables that could force gcloud to impersonate a Service Account
+# or use a static Service Account key file instead of the developer's own 3LO user identity.
+_BLOCKED_AUTH_ENV_VARS = (
+    "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+)
 
-def get_access_token() -> str:
+
+def _verify_user_identity_from_token(
+    token: str, gcloud_bin: str | None = None, env: dict[str, str] | None = None
+) -> tuple[str, str]:
+    """
+    Verifies that the OAuth2 access token belongs to an authenticated human user
+    (3LO / user ADC) and NOT a shared Service Account (*.gserviceaccount.com),
+    preventing 'Confused Deputy' ACL bypasses in Discovery Engine.
+    Returns (email, sub).
+    """
+    email = ""
+    sub = ""
+    try:
+        info_url = "https://oauth2.googleapis.com/tokeninfo"
+        req = urllib.request.Request(
+            info_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=10, context=_SSL_CTX) as resp:
+            info = json.loads(resp.read().decode("utf-8", errors="replace"))
+            if isinstance(info, dict):
+                email = str(info.get("email") or "").strip().lower()
+                sub = str(info.get("sub") or "").strip()
+    except Exception:
+        pass
+
+    if not email and gcloud_bin:
+        try:
+            acct = subprocess.check_output(
+                [gcloud_bin, "config", "get-value", "account", "--quiet"],
+                text=True,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=10,
+            ).strip().lower()
+            if acct and acct != "(unset)":
+                email = acct
+        except Exception:
+            pass
+
+    if email.endswith(".gserviceaccount.com"):
+        raise PermissionError(
+            f"Security Error (Confused Deputy Prevention): Active credential is a Service Account "
+            f"('{email}'). Running the Gemini Enterprise MCP bridge under a shared Service Account "
+            "is blocked because it could bypass per-user document ACLs and connector OAuth contexts. "
+            "Please authenticate with your personal user account via:\n"
+            "  gcloud auth login\n"
+            "or:\n"
+            "  gcloud auth application-default login --scopes='https://www.googleapis.com/auth/cloud-platform'"
+        )
+
+    return email or "authenticated-user", sub
+
+
+def get_caller_identity() -> tuple[str, str, str]:
+    """
+    Returns (access_token, caller_email, caller_sub) for the currently authenticated
+    end-user, refreshing from gcloud user credentials (or user ADC) every 5 minutes.
+    """
     now = time.time()
-    if _TOKEN_CACHE["token"] and now < _TOKEN_CACHE["expires_at"]:
-        return _TOKEN_CACHE["token"]
+    if (
+        _TOKEN_CACHE["token"]
+        and _TOKEN_CACHE["email"]
+        and now < _TOKEN_CACHE["expires_at"]
+    ):
+        return (
+            _TOKEN_CACHE["token"],
+            _TOKEN_CACHE["email"],
+            _TOKEN_CACHE["sub"],
+        )
 
-    env_token = os.environ.get("GE_MCP_ACCESS_TOKEN")
-    if env_token:
-        return env_token.strip()
-
-    env = dict(os.environ)
+    # Strip any service-account impersonation or static key overrides from environment
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _BLOCKED_AUTH_ENV_VARS
+    }
     existing_metrics = env.get("CLOUDSDK_METRICS_ENVIRONMENT", "")
     env["CLOUDSDK_METRICS_ENVIRONMENT"] = (
         f"{existing_metrics} datacloud.antigravity".strip()
@@ -113,26 +197,44 @@ def get_access_token() -> str:
 
     last_err = ""
     for gcloud_bin in _discover_gcloud_candidates():
-        try:
-            token = subprocess.check_output(
-                [gcloud_bin, "auth", "print-access-token"],
-                text=True,
-                stderr=subprocess.PIPE,
-                env=env,
-                timeout=15,
-            ).strip()
-            if token:
-                _TOKEN_CACHE["token"] = token
-                _TOKEN_CACHE["expires_at"] = now + 300
-                return token
-        except Exception as e:
-            last_err = str(e)
-            continue
+        for cmd in (
+            [gcloud_bin, "auth", "print-access-token"],
+            [gcloud_bin, "auth", "application-default", "print-access-token"],
+        ):
+            try:
+                token = subprocess.check_output(
+                    cmd,
+                    text=True,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    timeout=15,
+                ).strip()
+                if token:
+                    email, sub = _verify_user_identity_from_token(
+                        token, gcloud_bin=gcloud_bin, env=env
+                    )
+                    _TOKEN_CACHE["token"] = token
+                    _TOKEN_CACHE["email"] = email
+                    _TOKEN_CACHE["sub"] = sub
+                    _TOKEN_CACHE["expires_at"] = now + 300
+                    return token, email, sub
+            except PermissionError:
+                raise
+            except Exception as e:
+                last_err = str(e)
+                continue
 
     raise RuntimeError(
-        f"Failed to obtain Google Cloud access token via gcloud. "
-        f"Run 'gcloud auth login' first. Last error: {last_err}"
+        "Failed to obtain Google Cloud user access token via gcloud. "
+        "Run 'gcloud auth login' or "
+        "'gcloud auth application-default login --scopes=\"https://www.googleapis.com/auth/cloud-platform\"' "
+        f"first. Last error: {last_err}"
     )
+
+
+def get_access_token() -> str:
+    token, _, _ = get_caller_identity()
+    return token
 
 
 def de_request(
@@ -142,7 +244,7 @@ def de_request(
     body: dict[str, Any] | None = None,
     timeout: int = 60,
 ) -> tuple[int, Any]:
-    token = get_access_token()
+    token, _, _ = get_caller_identity()
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(
         url,
@@ -284,6 +386,10 @@ def write_dynamic_mcp_configs(
             backup_path = f"{cfg_path}.bak_{timestamp}"
             shutil.copy2(cfg_path, backup_path)
             try:
+                os.chmod(backup_path, 0o600)
+            except Exception:
+                pass
+            try:
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                     if isinstance(loaded, dict):
@@ -297,6 +403,10 @@ def write_dynamic_mcp_configs(
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
             f.write("\n")
+        try:
+            os.chmod(cfg_path, 0o600)
+        except Exception:
+            pass
         updated.append(cfg_path)
     return updated
 
@@ -308,8 +418,9 @@ def discover_engine_bound_resources(
     force_refresh: bool = False,
     timeout: int = 15,
 ) -> dict[str, Any]:
+    _, caller_email, _ = get_caller_identity()
     now = time.time()
-    cache_key = f"{project}:{location}:{engine_id}"
+    cache_key = f"{caller_email}:{project}:{location}:{engine_id}"
     if (
         not force_refresh
         and _ENGINE_SCOPE_CACHE.get("key") == cache_key
@@ -391,6 +502,7 @@ def discover_engine_bound_resources(
     ]
 
     result = {
+        "callerIdentity": caller_email,
         "project": project,
         "location": location,
         "engineId": engine_id,
@@ -417,24 +529,53 @@ def resolve_and_validate_connector(
     project: str,
     location: str,
     engine_id: str,
+    require_user_auth: bool = False,
 ) -> tuple[str | None, str | None]:
     scope = discover_engine_bound_resources(project, location, engine_id)
+    caller_email = scope.get("callerIdentity", "authenticated-user")
     allowlisted = scope.get("connectors", [])
     target = clean_collection_id(requested_connector)
     target_lower = target.lower()
 
+    matched_conn: dict[str, Any] | None = None
     for c in allowlisted:
         if c["connectorId"].lower() == target_lower:
-            return c["connectorId"], None
+            matched_conn = c
+            break
 
-    for c in allowlisted:
-        if (
-            c.get("dataSource", "").lower() == target_lower
-            or c.get("displayName", "").lower() == target_lower
-            or c.get("dataSourceDisplayName", "").lower() == target_lower
-            or target_lower in c["connectorId"].lower()
+    if not matched_conn:
+        for c in allowlisted:
+            if (
+                c.get("dataSource", "").lower() == target_lower
+                or c.get("displayName", "").lower() == target_lower
+                or c.get("dataSourceDisplayName", "").lower() == target_lower
+                or target_lower in c["connectorId"].lower()
+            ):
+                matched_conn = c
+                break
+
+    if matched_conn:
+        auth_state = str(matched_conn.get("authState") or "").upper()
+        modes = matched_conn.get("connectorModes") or []
+        if require_user_auth and (
+            auth_state in ("NOT_AUTHORIZED", "UNAUTHORIZED")
+            or (
+                ("ACTIONS" in modes or "FEDERATED" in modes)
+                and not matched_conn.get("authorized", False)
+            )
         ):
-            return c["connectorId"], None
+            return (
+                None,
+                (
+                    f"Access Denied (User Context Not Authorized): Connector "
+                    f"'{matched_conn['connectorId']}' is bound to engine '{engine_id}', "
+                    f"but calling user '{caller_email}' has authState='{auth_state or 'UNKNOWN'}'. "
+                    "Please open the Gemini Enterprise web app -> Connected apps and click "
+                    f"'Connect / Authorize' for '{matched_conn.get('displayName')}' under "
+                    f"your '{caller_email}' account."
+                ),
+            )
+        return matched_conn["connectorId"], None
 
     allowed_summary = (
         ", ".join(
@@ -679,10 +820,11 @@ def build_meta_tools(
     project: str, location: str, engine_id: str
 ) -> list[dict[str, Any]]:
     connector_summary = "call `ge_list_connectors` to view bound connectors"
-    cache_key = f"{project}:{location}:{engine_id}"
+    cached_email = _TOKEN_CACHE.get("email") or ""
+    cache_key = f"{cached_email}:{project}:{location}:{engine_id}"
     cached_scope = (
         _ENGINE_SCOPE_CACHE.get("data")
-        if _ENGINE_SCOPE_CACHE.get("key") == cache_key
+        if cached_email and _ENGINE_SCOPE_CACHE.get("key") == cache_key
         else None
     )
     if isinstance(cached_scope, dict):
@@ -944,6 +1086,7 @@ def execute_federated_datastore_search(
     in a single fast round-trip.
     """
     scope = discover_engine_bound_resources(project, location, engine_id)
+    caller_email = scope.get("callerIdentity", "authenticated-user")
     conn_info = next(
         (c for c in scope.get("connectors", []) if c["connectorId"] == connector_id),
         {},
@@ -984,7 +1127,11 @@ def execute_federated_datastore_search(
                 "POST",
                 search_url,
                 project,
-                body={"query": q, "pageSize": page_size},
+                body={
+                    "query": q,
+                    "pageSize": page_size,
+                    "userPseudoId": caller_email,
+                },
                 timeout=30,
             )
             items = []
@@ -1017,6 +1164,7 @@ def execute_federated_datastore_search(
                 "type": "text",
                 "text": json.dumps(
                     {
+                        "callerIdentity": caller_email,
                         "connectorId": connector_id,
                         "queriesExecuted": len(all_query_results),
                         "searchResults": all_query_results,
@@ -1049,7 +1197,7 @@ def handle_tool_call(
         if name == "ge_search_tools":
             raw_conn = arguments.get("connector", "")
             cid, err = resolve_and_validate_connector(
-                raw_conn, project, location, engine_id
+                raw_conn, project, location, engine_id, require_user_auth=False
             )
             if err or not cid:
                 return {
@@ -1080,6 +1228,7 @@ def handle_tool_call(
             }
 
             scope = discover_engine_bound_resources(project, location, engine_id)
+            caller_email = scope.get("callerIdentity", "authenticated-user")
             conn_info = next(
                 (c for c in scope.get("connectors", []) if c["connectorId"] == cid),
                 {},
@@ -1124,6 +1273,7 @@ def handle_tool_call(
                         "type": "text",
                         "text": json.dumps(
                             {
+                                "callerIdentity": caller_email,
                                 "engineId": engine_id,
                                 "connectorId": cid,
                                 "totalToolsOnConnector": len(raw_tools),
@@ -1139,7 +1289,7 @@ def handle_tool_call(
         if name == "ge_call_tool":
             raw_conn = arguments.get("connector", "")
             cid, err = resolve_and_validate_connector(
-                raw_conn, project, location, engine_id
+                raw_conn, project, location, engine_id, require_user_auth=True
             )
             if err or not cid:
                 return {
@@ -1191,9 +1341,14 @@ def handle_tool_call(
         if name == "ge_assist_query":
             query_text = arguments.get("query", "")
             scope = discover_engine_bound_resources(project, location, engine_id)
+            caller_email = scope.get("callerIdentity", "authenticated-user")
             ds_specs: list[dict[str, str]] = []
             seen_ds: set[str] = set()
             for c in scope.get("connectors", []):
+                # Only query user-scoped connectors where the calling user is not unauthorized
+                auth_state = str(c.get("authState") or "").upper()
+                if auth_state in ("NOT_AUTHORIZED", "UNAUTHORIZED"):
+                    continue
                 for ds_id in c.get("boundDataStores", []):
                     if ds_id and ds_id not in seen_ds:
                         seen_ds.add(ds_id)
@@ -1257,6 +1412,7 @@ def handle_tool_call(
                                 "type": "text",
                                 "text": json.dumps(
                                     {
+                                        "callerIdentity": caller_email,
                                         "engineId": engine_id,
                                         "answerText": "".join(text_parts).strip(),
                                     },

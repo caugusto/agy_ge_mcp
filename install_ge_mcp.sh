@@ -108,13 +108,22 @@ if [[ -z "$GCLOUD_BIN" ]]; then
 fi
 echo "[2/6] Found gcloud:  $GCLOUD_BIN"
 
-# 3. Verify gcloud auth token
-echo "[3/6] Verifying Google Cloud authentication..."
-TOKEN="$("$GCLOUD_BIN" auth print-access-token 2>/dev/null || true)"
-if [[ -z "$TOKEN" ]]; then
-  echo "ERROR: No active gcloud session. Run 'gcloud auth login' first and re-run this script." >&2
+# 3. Verify gcloud user authentication (and block Service Account / Confused Deputy)
+echo "[3/6] Verifying Google Cloud end-user authentication..."
+unset CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT GOOGLE_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE GOOGLE_APPLICATION_CREDENTIALS
+ACTIVE_ACCOUNT="$("$GCLOUD_BIN" config get-value account --quiet 2>/dev/null || true)"
+if [[ "$ACTIVE_ACCOUNT" == *.gserviceaccount.com ]]; then
+  echo "ERROR: Active gcloud account ('$ACTIVE_ACCOUNT') is a Service Account." >&2
+  echo "       To prevent Confused Deputy ACL bypasses, authenticate with your personal user account:" >&2
+  echo "         gcloud auth login" >&2
   exit 1
 fi
+TOKEN="$("$GCLOUD_BIN" auth print-access-token 2>/dev/null || "$GCLOUD_BIN" auth application-default print-access-token 2>/dev/null || true)"
+if [[ -z "$TOKEN" ]]; then
+  echo "ERROR: No active gcloud user session. Run 'gcloud auth login' first and re-run this script." >&2
+  exit 1
+fi
+echo "      Authenticated User: ${ACTIVE_ACCOUNT:-verified}"
 
 # Resolve numeric project number if a project ID string was provided
 RESOLVED_PROJECT_NUM="$("$GCLOUD_BIN" projects describe "$PROJECT" --format="value(projectNumber)" 2>/dev/null || true)"
@@ -151,8 +160,8 @@ mkdir -p "$TARGET_DIR"
 mkdir -p "$HOME/.gemini/antigravity"
 
 cp "$SOURCE_PY" "$TARGET_PY"
-chmod +x "$TARGET_PY"
-echo "[5/6] Installed MCP server script to: \$HOME/.gemini/config/ge_mcp_server.py"
+chmod 700 "$TARGET_PY"
+echo "[5/6] Installed MCP server script to: \$HOME/.gemini/config/ge_mcp_server.py (mode 0700)"
 
 "$PYTHON_BIN" "$TARGET_PY" \
   --project="$PROJECT_TARGET" \

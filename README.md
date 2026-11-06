@@ -38,7 +38,11 @@ flowchart LR
 ```
 
 > [!IMPORTANT]
-> **Strict Engine-Level Isolation:** `ge_mcp_server.py` inspects the target engine's `default_search_widget_config` (`collectionComponents`) and `dataStoreIds` before listing or invoking any tool. Even if a GCP project hosts dozens of connectors across other Gemini Enterprise instances, **users can only see and invoke connectors attached to their configured `GE_MCP_ENGINE`**.
+> **Strict Engine-Level & Per-User Identity Isolation (Confused Deputy Prevention):**
+> 1. **Engine Scope Guardrail:** `ge_mcp_server.py` inspects the target engine's `default_search_widget_config` (`collectionComponents`) and `dataStoreIds` before listing or invoking any tool. Even if a GCP project hosts dozens of connectors across other Gemini Enterprise instances, **users can only see and invoke connectors attached to their configured `GE_MCP_ENGINE`**.
+> 2. **End-User Identity Propagation (No Shared Service Accounts):** `ge_mcp_server.py` runs locally over STDIO and obtains the calling developer's personal OAuth token via `gcloud auth print-access-token` (or `gcloud auth application-default print-access-token`), stripping any service-account impersonation or key-file override environment variables (`CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT`, `GOOGLE_APPLICATION_CREDENTIALS`, etc.).
+> 3. **Service Account Blocking:** Every token is verified against `https://oauth2.googleapis.com/tokeninfo`. If the active credential belongs to a Service Account (`*.gserviceaccount.com`), execution is immediately blocked (`PermissionError`) so the server can never act as a Confused Deputy or bypass document-level ACLs.
+> 4. **Per-User Connector `authState` Enforcement:** `ge_call_tool` and `ge_assist_query` verify that the calling user's `connectorAuthState` is `AUTHORIZED` for user-scoped connectors and propagate `Authorization: Bearer <user_token>` and `X-Goog-User-Project: <project>` on every Discovery Engine request so each user only sees data and executes actions within their own security context.
 
 > [!NOTE]
 > **Discovery Engine API Versions (`v1` vs `v1alpha`):**
