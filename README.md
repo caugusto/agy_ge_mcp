@@ -44,11 +44,6 @@ flowchart LR
 > 3. **Service Account Blocking:** Every token is verified against `https://oauth2.googleapis.com/tokeninfo`. If the active credential belongs to a Service Account (`*.gserviceaccount.com`), execution is immediately blocked (`PermissionError`) so the server can never act as a Confused Deputy or bypass document-level ACLs.
 > 4. **Per-User Connector `authState` Enforcement:** `ge_call_tool` and `ge_assist_query` verify that the calling user's `connectorAuthState` is `AUTHORIZED` for user-scoped connectors and propagate `Authorization: Bearer <user_token>` and `X-Goog-User-Project: <project>` on every Discovery Engine request so each user only sees data and executes actions within their own security context.
 
-> [!NOTE]
-> **Discovery Engine API Versions (`v1` vs `v1alpha`):**
-> - **GA `v1` Endpoints Used:** Engine discovery/metadata (`GET /v1/.../engines/{id}`) and grounded enterprise search (`POST /v1/.../assistants/default_assistant:streamAssist`) use the General Availability **`v1`** API.
-> - **`v1alpha`-Only Endpoints Used:** The Connector MCP bridge (`POST /v1alpha/.../dataConnector:invokeConnectorMcp`) and BAP action state metadata (`dataConnector` / `widgetConfigs`) are currently only exposed in **`v1alpha`** (calling `:invokeConnectorMcp` on `v1` or `v1beta` returns `HTTP 404`).
-
 ---
 
 ## 2. Repository Contents
@@ -59,7 +54,6 @@ flowchart LR
 | [`install_ge_mcp.sh`](./install_ge_mcp.sh) | Automated installer script that detects `python3` and `gcloud`, discovers or validates `--engine` and its `--location`, installs `ge_mcp_server.py` into `$HOME/.gemini/config/`, safely merges `mcp_config.json`, and runs a live smoke test. |
 | [`mcp_config.example.json`](./mcp_config.example.json) | Portable, OS-agnostic `mcp_config.json` template using `$HOME` runtime expansion (no hardcoded `/Users/...` or `/home/...` paths). |
 | [`LICENSE`](./LICENSE) | Standard Apache License, Version 2.0 text. |
-| [`legacy_v1/ge_mcp_server.v1_backup.py`](./legacy_v1/ge_mcp_server.v1_backup.py) | Backup of the initial `v1` single-connector MCP server design. |
 
 ---
 
